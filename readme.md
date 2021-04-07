@@ -1,4 +1,5 @@
 基于pika的rabbitmq消息队列的类库
+支持 阿里云rabbitmq实例 与 自建的rabbitmq服务
 
 
 ### 注意

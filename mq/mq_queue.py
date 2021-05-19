@@ -45,6 +45,28 @@ class RabbitQueue(MyQueue):
                                                       accessSecret, instanceId, heartbeat)
         self.create_connection()
 
+    def __getattribute__(self, attr):
+        """每次使用connection，channel的时候都要检查一下是否已经断开连接了
+        """
+        if attr in ("connection", "channel"):
+            try:
+                connection = object.__getattribute__(self, "connection")
+                channel = object.__getattribute__(self, "channel")
+                connect_params = object.__getattribute__(self, "connect_params")
+                try:
+                    connection.process_data_events()
+                except (StreamLostError, ChannelWrongStateError, ValueError, TypeError):
+                    logging.debug("队列连接已断开或发生错误！")
+                if connection.is_closed or channel.is_closed:
+                    new_con = pika.BlockingConnection(connect_params)
+                    new_chan = new_con.channel()
+                    object.__setattr__(self, "connection", new_con)
+                    object.__setattr__(self, "channel", new_chan)
+                    logging.debug("重新连接了队列！")
+            except AttributeError:
+                pass
+        return object.__getattribute__(self, attr)
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close_connection()
 
@@ -80,25 +102,6 @@ class RabbitQueue(MyQueue):
             if port:
                 params['port'] = port
             return pika.ConnectionParameters(**params)
-
-    def reconnect_queue_if_close(func):
-        """如果连接断了，重连一下
-        """
-
-        def ware(self, *args, **kwargs):
-            try:
-                self.connection.process_data_events()
-            except (StreamLostError, ChannelWrongStateError):
-                logging.debug("队列连接已断开或发生错误！")
-                pass
-
-            if self.connection.is_closed or self.channel.is_closed:
-                logging.debug("重新连接了队列！")
-                self.create_connection()
-
-            return func(self, *args, **kwargs)
-
-        return ware
 
     def close_connection(self):
         self.connection.close()
@@ -156,7 +159,6 @@ class RabbitQueue(MyQueue):
     def bind_exchange_queue(self, queue, exchange, binding_key=__default_routing_key):
         self.channel.queue_bind(queue=queue, exchange=exchange, routing_key=binding_key)
 
-    @reconnect_queue_if_close
     def send(self, message, exchange, routing_key, **kwargs):
         """
         kwargs 参数说明：
@@ -191,7 +193,6 @@ class RabbitQueue(MyQueue):
         if close_connection:
             self.close_connection()
 
-    @reconnect_queue_if_close
     def consume(self, queue, auto_ack=False, inactivity_timeout=None, prefetch_count=None):
         if prefetch_count:
             self.channel.basic_qos(prefetch_count=prefetch_count)
@@ -199,7 +200,6 @@ class RabbitQueue(MyQueue):
         for nn in result:
             yield nn
 
-    @reconnect_queue_if_close
     def run(self):
         try:
             self.channel.start_consuming()
@@ -207,10 +207,8 @@ class RabbitQueue(MyQueue):
             self.channel.stop_consuming()
             self.close_connection()
 
-    @reconnect_queue_if_close
     def ack_message(self, method):
         self.channel.basic_ack(delivery_tag=method.delivery_tag)
 
-    @reconnect_queue_if_close
     def rej_message(self, method, requeue=False):
         self.channel.basic_reject(delivery_tag=method.delivery_tag, requeue=requeue)

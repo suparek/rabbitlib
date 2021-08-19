@@ -47,14 +47,12 @@ def process(body):
 
 
 def main():
-    myqueue = MessageQueue(host='kangfuzi05', port='', mq_username='yangtao', mq_password='yangtao')
-    myqueue.declare_delay_exchange('notify_dingding_delay', exchange_type='direct')
-    myqueue.declare_queue('noti_delay')
-    # myqueue.connection.close()
-    # myqueue.channel.close()
-    myqueue.bind_exchange_queue('noti_delay', 'notify_dingding_delay', binding_key="content_info")
+    myqueue = MessageQueue(host='myhost', port='', mq_username='myuser', mq_password='mypasswd')
+    myqueue.declare_delay_exchange('noti_chan_delay', exchange_type='direct')
+    myqueue.declare_queue('noti_qu_delay')
+    myqueue.bind_exchange_queue('noti_qu_delay', 'noti_chan_delay', binding_key="content_info")
     while 1:
-        suke = myqueue.consume('noti_delay')
+        suke = myqueue.consume('noti_qu_delay')
         for method, properties, body in suke:
             try:
                 process(body)

@@ -1,5 +1,6 @@
 #encoding=utf-8
 import time
+import uuid
 import logging
 import requests
 import pika
@@ -48,6 +49,12 @@ class RabbitQueue(MyQueue):
     def __getattribute__(self, attr):
         """每次使用connection，channel的时候都要检查一下是否已经断开连接了
         """
+        try:
+            create_kk = object.__getattribute__(self, "create_kk")
+        except AttributeError:
+            create_kk = 0
+        if create_kk:
+            return object.__getattribute__(self, attr)
         if attr in ("connection", "channel"):
             try:
                 connection = object.__getattribute__(self, "connection")
@@ -56,13 +63,30 @@ class RabbitQueue(MyQueue):
                 try:
                     connection.process_data_events()
                 except (StreamLostError, ChannelWrongStateError, ValueError, TypeError):
-                    logging.debug("队列连接已断开或发生错误！")
+                    logging.info("队列连接已断开或发生错误！")
                 if connection.is_closed or channel.is_closed:
                     new_con = pika.BlockingConnection(connect_params)
                     new_chan = new_con.channel()
                     object.__setattr__(self, "connection", new_con)
                     object.__setattr__(self, "channel", new_chan)
-                    logging.debug("重新连接了队列！")
+                    logging.info("重新连接了队列！")
+            except AttributeError:
+                pass
+        elif attr in ("send_connection", "send_channel"):
+            try:
+                send_connection = object.__getattribute__(self, "send_connection")
+                send_channel = object.__getattribute__(self, "send_channel")
+                connect_params = object.__getattribute__(self, "connect_params")
+                try:
+                    send_connection.process_data_events()
+                except (StreamLostError, ChannelWrongStateError, ValueError, TypeError):
+                    logging.info("发送队列连接已断开或发生错误！")
+                if send_connection.is_closed or send_channel.is_closed:
+                    new_send_con = pika.BlockingConnection(connect_params)
+                    new_send_channel = new_send_con.channel(channel_number=9)
+                    object.__setattr__(self, "send_connection", new_send_con)
+                    object.__setattr__(self, "send_channel", new_send_channel)
+                    logging.info("重新连接了发送队列！")
             except AttributeError:
                 pass
         return object.__getattribute__(self, attr)
@@ -71,8 +95,12 @@ class RabbitQueue(MyQueue):
         self.close_connection()
 
     def create_connection(self):
+        self.create_kk = 1
         self.connection = pika.BlockingConnection(self.connect_params)
         self.channel = self.connection.channel()
+        self.send_connection = pika.BlockingConnection(self.connect_params)
+        self.send_channel = self.send_connection.channel(channel_number=9)
+        self.create_kk = 0
 
     def getConnectionParam(self,
                            host,
@@ -103,8 +131,32 @@ class RabbitQueue(MyQueue):
                 params['port'] = port
             return pika.ConnectionParameters(**params)
 
+    def reconnect_queue_if_close(func):
+        """如果连接断了，重连一下
+        """
+
+        def ware(self, *args, **kwargs):
+            try:
+                self.connection.process_data_events()
+            except (StreamLostError, ChannelWrongStateError, ValueError):
+                logging.debug("队列连接已断开或发生错误！")
+                pass
+
+            if self.connection.is_closed or self.channel.is_closed:
+                logging.debug("重新连接了队列！")
+                self.create_connection()
+
+            return func(self, *args, **kwargs)
+
+        return ware
+
     def close_connection(self):
-        self.connection.close()
+        self.create_kk = 1
+        if not self.send_connection.is_closed:
+            self.send_connection.close()
+        if not self.connection.is_closed:
+            self.connection.close()
+        self.create_kk = 0
 
     def declare_exchange(self, exchange, **kwargs):
         exchange_type = kwargs.get('exchange_type', 'direct')
@@ -129,6 +181,10 @@ class RabbitQueue(MyQueue):
                 exchange=exchange, exchange_type='x-delayed-message', durable=durable, arguments=arguments)
         except ChannelClosedByBroker as e:
             logging.warning(e)
+            self.create_kk = 1
+            self.connection.close()
+            self.send_connection.close()
+            self.create_kk = 0
             self.create_connection()
             self.channel.exchange_declare(
                 exchange=exchange, exchange_type=exchange_type, durable=durable, arguments=arguments)
@@ -156,9 +212,11 @@ class RabbitQueue(MyQueue):
     def delete_queue(self, queue):
         self.channel.queue_delete(queue=queue)
 
+    # @reconnect_queue_if_close
     def bind_exchange_queue(self, queue, exchange, binding_key=__default_routing_key):
         self.channel.queue_bind(queue=queue, exchange=exchange, routing_key=binding_key)
 
+    # @reconnect_queue_if_close
     def send(self, message, exchange, routing_key, **kwargs):
         """
         kwargs 参数说明：
@@ -167,7 +225,7 @@ class RabbitQueue(MyQueue):
         priority是消息优先级
         expiration是消息生存周期，与delay相冲突，如果使用了expiration，delay就无效了
         """
-        message_id = kwargs.get('message_id')
+        message_id = kwargs.get('message_id') or str(uuid.uuid4())
         expiration = kwargs.get('expiration')
         close_connection = kwargs.get('close_connection', False)
         priority = kwargs.get('priority', 0)
@@ -185,7 +243,7 @@ class RabbitQueue(MyQueue):
         headers = self.arg_set('x-delay', delay, headers)
 
         property_params = self.arg_set('headers', headers, property_params)
-        self.channel.basic_publish(
+        self.send_channel.basic_publish(
             exchange=exchange,
             routing_key=routing_key,
             body=message,
@@ -193,6 +251,7 @@ class RabbitQueue(MyQueue):
         if close_connection:
             self.close_connection()
 
+    # @reconnect_queue_if_close
     def consume(self, queue, auto_ack=False, inactivity_timeout=None, prefetch_count=None):
         if prefetch_count:
             self.channel.basic_qos(prefetch_count=prefetch_count)
@@ -200,6 +259,7 @@ class RabbitQueue(MyQueue):
         for nn in result:
             yield nn
 
+    # @reconnect_queue_if_close
     def run(self):
         try:
             self.channel.start_consuming()
@@ -207,8 +267,10 @@ class RabbitQueue(MyQueue):
             self.channel.stop_consuming()
             self.close_connection()
 
+    # @reconnect_queue_if_close
     def ack_message(self, method):
-        self.channel.basic_ack(delivery_tag=method.delivery_tag)
+        return self.channel.basic_ack(delivery_tag=method.delivery_tag)
 
+    # @reconnect_queue_if_close
     def rej_message(self, method, requeue=False):
-        self.channel.basic_reject(delivery_tag=method.delivery_tag, requeue=requeue)
+        return self.channel.basic_reject(delivery_tag=method.delivery_tag, requeue=requeue)

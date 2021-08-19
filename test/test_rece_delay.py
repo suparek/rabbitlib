@@ -13,37 +13,10 @@ from mq import MessageQueue
 """
 
 
-def _notify_dingding(content, ding_urls):
-    if not ding_urls:
-        return None
-    data = {
-        'msgtype': 'text',
-        'text': {
-            'content': content,
-        },
-    }
-    for ding_url in ding_urls:
-        try:
-            start = time.time()
-            resp = requests.post(ding_url, json=data, timeout=5)
-        except requests.exceptions.RequestException as ex:
-            logging.exception("push dingtalk error: %s, params: %s", ex, data)
-            return
-        finally:
-            end = time.time()
-            logging.info("push dingtalk cost: %f, params: %s", end - start, data)
-        ret = resp.json()
-        logging.info("push dingtalk result: %s", resp.content)
-        if ret['errcode'] != 0:
-            logging.error("push dingtalk failed, response: %s, params: %s", resp.content, data)
-
-
 def process(body):
     in_data = json.loads(body)
     content = in_data.get('content', '')
-    ding_urls = in_data.get('ding_urls', ())
-    print(content, ding_urls)
-    # _notify_dingding(content, ding_urls)
+    print(content)
 
 
 def main():
